@@ -1,21 +1,27 @@
 """
 Scheduler + Auto-Reaction Telegram Bot (multi-user, dinamik kanallar)
 ----------------------------------------------------------------------
-- CHANNELS yoki SUPERADMIN_ID kabi qattiq (static) ENV yo'q. Kanallar
-  DINAMIK ravishda aniqlanadi: botni istalgan kanalga ADMIN qilib
-  qo'shsangiz, bot buni avtomatik his qiladi (my_chat_member) va o'sha
-  kanalni DB ga (supergroup) qo'shadi.
-- Har qanday foydalanuvchi botdan foydalana oladi: /schedule bosilganda
-  bot foydalanuvchiga faqat U HAM, BOT HAM admin bo'lgan kanallarni
-  ko'rsatadi (get_chat_member orqali tekshiriladi) - ya'ni kimdir
-  boshqa birovning kanaliga post rejalashtira olmaydi.
-- Bot admin bo'lgan HAR BIR kanaldagi HAR QANDAY post (o'zinikimi,
-  boshqasinikimi) ga avtomatik ⚡ reaksiya bosiladi.
-- DATABASE: mahalliy fayl EMAS (Render'da disk vaqtinchalik, redeploy'da
-  o'chib ketadi). Buning o'rniga alohida Telegram supergroup ishlatiladi:
-  bot shu guruhda bitta pinned xabarni (kanallar ro'yxati + rejalar)
-  JSON holida tahrirlab boradi. Restart bo'lganda ham get_chat orqali
-  pinned xabar o'qilib, holat tiklanadi.
+- Kanallar STATIK env orqali emas, DINAMIK aniqlanadi: botni istalgan
+  kanalga admin qilib qo'shsangiz, bot buni avtomatik his qiladi
+  (my_chat_member) va o'sha kanalni DB ga (supergroup) qo'shadi.
+- Kanal qo'shilganda, uni QO'SHGAN ODAMGA DM orqali inline reaksiya
+  tanlagichi yuboriladi - shu kanal uchun qaysi reaksiya (⚡, 👍, ❤️ va h.k.)
+  qo'llanilishini U tanlaydi. Istagan payt "Kanallarim" bo'limidan
+  o'zgartirish mumkin.
+- Har qanday foydalanuvchi botdan foydalana oladi, LEKIN faqat O'ZI ADMIN
+  bo'lgan (va bot ham admin bo'lgan) kanallar bilan ishlay oladi -
+  get_chat_member orqali har doim tekshiriladi. Boshqa birovning
+  kanaliga hech kim ta'sir qila olmaydi.
+- Bot admin bo'lgan har bir kanaldagi HAR QANDAY post (o'zinikimi,
+  boshqasinikimi) ga o'sha kanal uchun tanlangan reaksiya avtomatik bosiladi.
+- "Superadmin panel" - lekin ruxsat doirasida: "Kanallarim" (reaksiyani
+  boshqarish) va "Hoziroq yuborish" (bir nechta O'Z kanalingizga birdan
+  xabar yuborish). Faqat sizning haqiqiy admin bo'lgan joylaringiz bilan
+  ishlaydi - boshqa birovning kanaliga yubora olmaysiz.
+- DATABASE: mahalliy fayl EMAS (Render'da disk vaqtinchalik). Buning
+  o'rniga alohida Telegram supergroup ishlatiladi: bot shu guruhda bitta
+  pinned xabarni (kanallar + reaksiyalar + rejalar) JSON holida
+  tahrirlab boradi. Restart bo'lganda ham shu xabar o'qilib tiklanadi.
 - Webhook orqali ishlaydi (Render uchun moslashtirilgan, aiohttp)
 
 ENV o'zgaruvchilar:
@@ -76,9 +82,15 @@ DB_GROUP_ID = int(os.environ["DB_GROUP_ID"])
 PORT = int(os.environ.get("PORT", 8080))
 TZ = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Tashkent"))
 
-REACTION_EMOJI = "⚡"
 DB_MARKER = "#BOT_DB"
 ADMIN_STATUSES = (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR)
+DEFAULT_REACTION = "⚡"
+
+# Tanlash uchun mavjud (bepul, premium bo'lmagan) reaksiyalar to'plami
+REACTIONS = [
+    "⚡", "👍", "👎", "❤️", "🔥", "🥰", "👏", "😁",
+    "🤔", "🎉", "🙏", "👌", "💯", "🤣", "😢", "🤯",
+]
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
@@ -88,7 +100,7 @@ dp.include_router(router)
 scheduler = AsyncIOScheduler(timezone=TZ)
 
 # in-memory holat, har doim DB_GROUP dagi pinned xabar bilan sinxron
-CHANNELS: dict = {}   # {"<chat_id>": {"title": str}}
+CHANNELS: dict = {}   # {"<chat_id>": {"title": str, "reaction": str, "added_by": int}}
 JOBS: dict = {}       # {job_id: {...}}
 DB_MESSAGE_ID: int | None = None
 
@@ -155,26 +167,73 @@ async def db_save() -> None:
             pass
 
 # ---------------------------------------------------------------------------
-# Kanallarni dinamik aniqlash: bot biror kanalga admin qilib qo'shilganda
+# Kanallarni dinamik aniqlash + qo'shgan odamga reaksiya tanlagichini yuborish
 # ---------------------------------------------------------------------------
+
+def reaction_picker_kb(chat_id: str) -> InlineKeyboardMarkup:
+    rows = []
+    row = []
+    for idx, emoji in enumerate(REACTIONS):
+        row.append(InlineKeyboardButton(text=emoji, callback_data=f"setreact:{chat_id}:{idx}"))
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 @router.my_chat_member()
 async def on_bot_membership_changed(event: ChatMemberUpdated) -> None:
-    if event.chat.type not in ("channel",):
+    if event.chat.type != "channel":
         return
     chat_id = str(event.chat.id)
     new_status = event.new_chat_member.status
 
     if new_status in ADMIN_STATUSES:
         if chat_id not in CHANNELS:
-            CHANNELS[chat_id] = {"title": event.chat.title or chat_id}
+            CHANNELS[chat_id] = {
+                "title": event.chat.title or chat_id,
+                "reaction": DEFAULT_REACTION,
+                "added_by": event.from_user.id if event.from_user else None,
+            }
             await db_save()
-            log.info("Yangi kanal ro'yxatga qo'shildi: %s (%s)", event.chat.title, chat_id)
+            log.info("Yangi kanal qo'shildi: %s (%s)", event.chat.title, chat_id)
+            if event.from_user:
+                try:
+                    await bot.send_message(
+                        event.from_user.id,
+                        f"✅ <b>{event.chat.title}</b> kanaliga admin qilib qo'shildim.\n"
+                        f"Bu kanaldagi postlarga qaysi reaksiya bosilsin?",
+                        reply_markup=reaction_picker_kb(chat_id),
+                    )
+                except Exception:
+                    log.info("Foydalanuvchiga DM yuborib bo'lmadi (bot bilan /start bosmagan bo'lishi mumkin)")
     else:
         if chat_id in CHANNELS:
             CHANNELS.pop(chat_id, None)
             await db_save()
             log.info("Kanal ro'yxatdan olib tashlandi (bot admin emas): %s", chat_id)
+
+
+@router.callback_query(F.data.startswith("setreact:"))
+async def set_reaction(callback: CallbackQuery):
+    _, chat_id, idx_str = callback.data.split(":", 2)
+    try:
+        member = await bot.get_chat_member(int(chat_id), callback.from_user.id)
+        if member.status not in ADMIN_STATUSES:
+            return await callback.answer("Siz bu kanalda admin emassiz.", show_alert=True)
+    except Exception:
+        return await callback.answer("Kanalni tekshirib bo'lmadi.", show_alert=True)
+
+    if chat_id not in CHANNELS:
+        return await callback.answer("Kanal topilmadi.", show_alert=True)
+
+    emoji = REACTIONS[int(idx_str)]
+    CHANNELS[chat_id]["reaction"] = emoji
+    await db_save()
+    await callback.message.edit_text(f"✅ Bu kanal uchun reaksiya: {emoji}")
+    await callback.answer("Saqlandi.")
 
 # ---------------------------------------------------------------------------
 # Xabarni yuborish (scheduled ish)
@@ -237,7 +296,7 @@ async def user_admin_channels(user_id: int) -> dict:
     return result
 
 # ---------------------------------------------------------------------------
-# FSM: /schedule oqimi
+# FSM
 # ---------------------------------------------------------------------------
 
 class ScheduleStates(StatesGroup):
@@ -247,18 +306,36 @@ class ScheduleStates(StatesGroup):
     confirming = State()
 
 
+class BroadcastStates(StatesGroup):
+    selecting_channels = State()
+    waiting_content = State()
+    confirming = State()
+
+
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📅 Rejalashtirish", callback_data="menu:schedule")],
+        [InlineKeyboardButton(text="📢 Hoziroq yuborish", callback_data="menu:broadcast")],
         [InlineKeyboardButton(text="📋 Ro'yxat", callback_data="menu:list")],
+        [InlineKeyboardButton(text="⚙️ Kanallarim", callback_data="menu:mychannels")],
     ])
 
 
-def channels_kb(channels: dict) -> InlineKeyboardMarkup:
+def channels_kb(channels: dict, prefix: str) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text=info["title"], callback_data=f"ch:{chat_id}")]
+        [InlineKeyboardButton(text=info["title"], callback_data=f"{prefix}:{chat_id}")]
         for chat_id, info in channels.items()
     ]
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="menu:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def broadcast_select_kb(channels: dict, selected: list) -> InlineKeyboardMarkup:
+    rows = []
+    for chat_id, info in channels.items():
+        mark = "✅ " if chat_id in selected else ""
+        rows.append([InlineKeyboardButton(text=f"{mark}{info['title']}", callback_data=f"bcsel:{chat_id}")])
+    rows.append([InlineKeyboardButton(text="➡️ Davom etish", callback_data="bcnext")])
     rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="menu:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -287,13 +364,26 @@ def job_list_kb(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def my_channels_kb(channels: dict) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(
+            text=f"{info['title']} ({info.get('reaction', DEFAULT_REACTION)})",
+            callback_data=f"chreact:{chat_id}",
+        )]
+        for chat_id, info in channels.items()
+    ]
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="menu:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     if message.chat.type != "private":
         return
     await message.answer(
-        "Salom! Meni istalgan kanalingizga ADMIN qilib qo'shing, "
-        "shundan so'ng o'sha kanalga post rejalashtira olasiz.\n\nNima qilamiz?",
+        "Salom! Meni istalgan kanalingizga ADMIN qilib qo'shing - "
+        "avtomatik ravishda tanib olaman va reaksiya tanlashni so'rayman.\n\n"
+        "Nima qilamiz?",
         reply_markup=main_menu_kb(),
     )
 
@@ -305,17 +395,41 @@ async def menu_back(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+@router.callback_query(F.data == "menu:mychannels")
+async def menu_mychannels(callback: CallbackQuery):
+    my_channels = await user_admin_channels(callback.from_user.id)
+    if not my_channels:
+        return await callback.answer("Siz admin bo'lgan kanal topilmadi.", show_alert=True)
+    await callback.message.edit_text(
+        "Kanallaringiz (reaksiyani o'zgartirish uchun bosing):",
+        reply_markup=my_channels_kb(my_channels),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("chreact:"))
+async def choose_channel_reaction(callback: CallbackQuery):
+    chat_id = callback.data.split(":", 1)[1]
+    try:
+        member = await bot.get_chat_member(int(chat_id), callback.from_user.id)
+        if member.status not in ADMIN_STATUSES:
+            return await callback.answer("Siz bu kanalda admin emassiz.", show_alert=True)
+    except Exception:
+        return await callback.answer("Kanalni tekshirib bo'lmadi.", show_alert=True)
+    await callback.message.edit_text("Reaksiyani tanlang:", reply_markup=reaction_picker_kb(chat_id))
+    await callback.answer()
+
+
 @router.callback_query(F.data == "menu:schedule")
 async def menu_schedule(callback: CallbackQuery, state: FSMContext):
     my_channels = await user_admin_channels(callback.from_user.id)
     if not my_channels:
         return await callback.answer(
-            "Siz admin bo'lgan va bot ham admin bo'lgan kanal topilmadi. "
-            "Avval botni kanalingizga admin qilib qo'shing.",
+            "Siz admin bo'lgan va bot ham admin bo'lgan kanal topilmadi.",
             show_alert=True,
         )
     await state.set_state(ScheduleStates.choosing_channel)
-    await callback.message.edit_text("Qaysi kanalga yuborilsin?", reply_markup=channels_kb(my_channels))
+    await callback.message.edit_text("Qaysi kanalga yuborilsin?", reply_markup=channels_kb(my_channels, "ch"))
     await callback.answer()
 
 
@@ -367,7 +481,6 @@ async def noop(callback: CallbackQuery):
 @router.callback_query(ScheduleStates.choosing_channel, F.data.startswith("ch:"))
 async def choose_channel(callback: CallbackQuery, state: FSMContext):
     channel_id = int(callback.data.split(":", 1)[1])
-    # xavfsizlik: foydalanuvchi haqiqatan ham shu kanalda admin ekanini qayta tekshiramiz
     try:
         member = await bot.get_chat_member(channel_id, callback.from_user.id)
         if member.status not in ADMIN_STATUSES:
@@ -448,18 +561,113 @@ async def confirm_schedule(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 # ---------------------------------------------------------------------------
-# Avtomatik reaksiya: har bir (dinamik) kanaldagi HAR QANDAY postga ⚡
+# "Hoziroq yuborish" - faqat o'zi admin bo'lgan bir nechta kanalga birdan
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "menu:broadcast")
+async def menu_broadcast(callback: CallbackQuery, state: FSMContext):
+    my_channels = await user_admin_channels(callback.from_user.id)
+    if not my_channels:
+        return await callback.answer("Siz admin bo'lgan kanal topilmadi.", show_alert=True)
+    await state.set_state(BroadcastStates.selecting_channels)
+    await state.update_data(selected=[])
+    await callback.message.edit_text(
+        "Qaysi kanallarga yuborilsin? (bir nechtasini tanlashingiz mumkin)",
+        reply_markup=broadcast_select_kb(my_channels, []),
+    )
+    await callback.answer()
+
+
+@router.callback_query(BroadcastStates.selecting_channels, F.data.startswith("bcsel:"))
+async def broadcast_toggle(callback: CallbackQuery, state: FSMContext):
+    chat_id = callback.data.split(":", 1)[1]
+    my_channels = await user_admin_channels(callback.from_user.id)
+    if chat_id not in my_channels:
+        return await callback.answer("Bu kanal sizga tegishli emas.", show_alert=True)
+
+    data = await state.get_data()
+    selected = data.get("selected", [])
+    if chat_id in selected:
+        selected.remove(chat_id)
+    else:
+        selected.append(chat_id)
+    await state.update_data(selected=selected)
+    await callback.message.edit_reply_markup(reply_markup=broadcast_select_kb(my_channels, selected))
+    await callback.answer()
+
+
+@router.callback_query(BroadcastStates.selecting_channels, F.data == "bcnext")
+async def broadcast_next(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("selected"):
+        return await callback.answer("Kamida bitta kanal tanlang.", show_alert=True)
+    await state.set_state(BroadcastStates.waiting_content)
+    await callback.message.edit_text("Yubormoqchi bo'lgan xabaringizni yuboring.")
+    await callback.answer()
+
+
+@router.message(BroadcastStates.waiting_content)
+async def broadcast_receive_content(message: Message, state: FSMContext):
+    await state.update_data(from_chat_id=message.chat.id, message_id=message.message_id)
+    data = await state.get_data()
+    my_channels = await user_admin_channels(message.from_user.id)
+    titles = [my_channels[c]["title"] for c in data["selected"] if c in my_channels]
+    await state.set_state(BroadcastStates.confirming)
+    await message.answer(
+        "Tasdiqlaysizmi?\nQuyidagi kanallarga yuboriladi:\n- " + "\n- ".join(titles),
+        reply_markup=confirm_kb(),
+    )
+
+
+@router.callback_query(BroadcastStates.confirming, F.data.startswith("confirm:"))
+async def broadcast_confirm(callback: CallbackQuery, state: FSMContext):
+    action = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    await state.clear()
+
+    if action == "no":
+        await callback.message.edit_text("Bekor qilindi.", reply_markup=main_menu_kb())
+        return await callback.answer()
+
+    # xavfsizlik: yuborishdan oldin har bir kanal uchun huquqni QAYTA tekshiramiz
+    my_channels = await user_admin_channels(callback.from_user.id)
+    sent, failed = 0, 0
+    for chat_id in data.get("selected", []):
+        if chat_id not in my_channels:
+            failed += 1
+            continue
+        try:
+            await bot.copy_message(
+                chat_id=int(chat_id),
+                from_chat_id=data["from_chat_id"],
+                message_id=data["message_id"],
+            )
+            sent += 1
+        except Exception:
+            log.exception("Broadcast xato: %s", chat_id)
+            failed += 1
+
+    await callback.message.edit_text(
+        f"✅ Yuborildi: {sent} ta kanalga" + (f", {failed} tasi muvaffaqiyatsiz." if failed else "."),
+        reply_markup=main_menu_kb(),
+    )
+    await callback.answer()
+
+# ---------------------------------------------------------------------------
+# Avtomatik reaksiya: har bir (dinamik) kanaldagi HAR QANDAY postga
 # ---------------------------------------------------------------------------
 
 @router.channel_post()
 async def auto_react(message: Message):
-    if str(message.chat.id) not in CHANNELS:
+    chat_id = str(message.chat.id)
+    if chat_id not in CHANNELS:
         return
+    emoji = CHANNELS[chat_id].get("reaction", DEFAULT_REACTION)
     try:
         await bot.set_message_reaction(
             chat_id=message.chat.id,
             message_id=message.message_id,
-            reaction=[ReactionTypeEmoji(emoji=REACTION_EMOJI)],
+            reaction=[ReactionTypeEmoji(emoji=emoji)],
         )
     except Exception:
         log.exception("Reaksiya bosishda xato: chat=%s msg=%s", message.chat.id, message.message_id)
