@@ -1,27 +1,30 @@
 """
-Scheduler + Auto-Reaction Telegram Bot
----------------------------------------
-- Barcha boshqaruv INLINE tugmalar orqali (buyruq yozish shart emas)
-- /schedule oqimi: kanal tanlash -> kontent yuborish -> vaqt kiritish -> inline tasdiqlash
-- Belgilangan vaqtda xabar kanalga copy_message orqali yuboriladi
-- Bot admin bo'lgan HAR BIR kanaldagi HAR QANDAY post (o'zinikimi, boshqasinikimi)
-  ga avtomatik ⚡ reaksiya bosiladi
-- DATABASE: mahalliy fayl EMAS (Render'da disk vaqtinchalik, redeploy'da o'chib ketadi).
-  Buning o'rniga alohida Telegram supergroup ishlatiladi: bot shu guruhda bitta
-  pinned xabarni JOB'lar bilan tahrirlab boradi. Restart/redeploy bo'lganda ham
-  get_chat orqali pinned xabar o'qilib, holat tiklanadi.
+Scheduler + Auto-Reaction Telegram Bot (multi-user, dinamik kanallar)
+----------------------------------------------------------------------
+- CHANNELS yoki SUPERADMIN_ID kabi qattiq (static) ENV yo'q. Kanallar
+  DINAMIK ravishda aniqlanadi: botni istalgan kanalga ADMIN qilib
+  qo'shsangiz, bot buni avtomatik his qiladi (my_chat_member) va o'sha
+  kanalni DB ga (supergroup) qo'shadi.
+- Har qanday foydalanuvchi botdan foydalana oladi: /schedule bosilganda
+  bot foydalanuvchiga faqat U HAM, BOT HAM admin bo'lgan kanallarni
+  ko'rsatadi (get_chat_member orqali tekshiriladi) - ya'ni kimdir
+  boshqa birovning kanaliga post rejalashtira olmaydi.
+- Bot admin bo'lgan HAR BIR kanaldagi HAR QANDAY post (o'zinikimi,
+  boshqasinikimi) ga avtomatik ⚡ reaksiya bosiladi.
+- DATABASE: mahalliy fayl EMAS (Render'da disk vaqtinchalik, redeploy'da
+  o'chib ketadi). Buning o'rniga alohida Telegram supergroup ishlatiladi:
+  bot shu guruhda bitta pinned xabarni (kanallar ro'yxati + rejalar)
+  JSON holida tahrirlab boradi. Restart bo'lganda ham get_chat orqali
+  pinned xabar o'qilib, holat tiklanadi.
 - Webhook orqali ishlaydi (Render uchun moslashtirilgan, aiohttp)
 
 ENV o'zgaruvchilar:
-    BOT_TOKEN        - bot tokeni (majburiy)
-    WEBHOOK_URL       - https://sizning-domen.onrender.com  (majburiy)
-    CHANNELS          - reaksiya bosiladigan / post qilinadigan kanal ID lari, vergul bilan
-                        masalan: -1001234567890,-1009876543210 (majburiy)
-    SUPERADMIN_ID     - botni boshqaradigan foydalanuvchi Telegram ID (majburiy)
-    DB_GROUP_ID       - "database" sifatida ishlatiladigan supergroup ID (majburiy)
-                        bot shu guruhda ADMIN bo'lishi va xabar pin qila olishi kerak
-    PORT              - (ixtiyoriy, default 8080)
-    TIMEZONE          - (ixtiyoriy, default Asia/Tashkent)
+    BOT_TOKEN     - bot tokeni (majburiy)
+    WEBHOOK_URL   - https://sizning-domen.onrender.com  (majburiy)
+    DB_GROUP_ID   - "database" sifatida ishlatiladigan supergroup ID (majburiy)
+                    bot shu guruhda ADMIN bo'lishi va xabar pin qila olishi kerak
+    PORT          - (ixtiyoriy, default 8080)
+    TIMEZONE      - (ixtiyoriy, default Asia/Tashkent)
 
 requirements.txt:
     aiogram==3.13.1
@@ -31,7 +34,6 @@ requirements.txt:
 Ishga tushirish (Render uchun): python bot.py
 """
 
-import asyncio
 import json
 import logging
 import os
@@ -40,13 +42,14 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.enums import ChatMemberStatus, ParseMode
+from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery,
+    ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -69,14 +72,13 @@ WEBHOOK_URL = os.environ["WEBHOOK_URL"].rstrip("/")
 WEBHOOK_PATH = "/webhook"
 FULL_WEBHOOK_URL = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
 
-CHANNELS = [int(x.strip()) for x in os.environ["CHANNELS"].split(",") if x.strip()]
-SUPERADMIN_ID = int(os.environ["SUPERADMIN_ID"])
 DB_GROUP_ID = int(os.environ["DB_GROUP_ID"])
 PORT = int(os.environ.get("PORT", 8080))
 TZ = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Tashkent"))
 
 REACTION_EMOJI = "⚡"
-DB_MARKER = "#JOBS_DB"  # pinned xabarni topish/aniqlash uchun belgi
+DB_MARKER = "#BOT_DB"
+ADMIN_STATUSES = (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR)
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
@@ -85,44 +87,44 @@ dp.include_router(router)
 
 scheduler = AsyncIOScheduler(timezone=TZ)
 
-# in-memory holat (har doim DB_GROUP dagi pinned xabar bilan sinxron saqlanadi)
-JOBS: dict = {}
+# in-memory holat, har doim DB_GROUP dagi pinned xabar bilan sinxron
+CHANNELS: dict = {}   # {"<chat_id>": {"title": str}}
+JOBS: dict = {}       # {job_id: {...}}
 DB_MESSAGE_ID: int | None = None
 
 # ---------------------------------------------------------------------------
 # "Database": supergroupdagi pinned xabar orqali saqlash
 # ---------------------------------------------------------------------------
 
-def _serialize_jobs() -> str:
-    body = json.dumps(JOBS, ensure_ascii=False)
+def _serialize_state() -> str:
+    body = json.dumps({"channels": CHANNELS, "jobs": JOBS}, ensure_ascii=False)
     return f"{DB_MARKER}\n<code>{body}</code>"
 
 
-def _deserialize_jobs(text: str) -> dict:
+def _deserialize_state(text: str) -> tuple[dict, dict]:
     try:
         raw = text.split("\n", 1)[1]
         raw = raw.replace("<code>", "").replace("</code>", "")
-        return json.loads(raw)
+        data = json.loads(raw)
+        return data.get("channels", {}), data.get("jobs", {})
     except Exception:
-        return {}
+        return {}, {}
 
 
 async def db_load_on_startup() -> None:
-    """Bot ishga tushganda DB_GROUP dagi pinned xabarni o'qib, holatni tiklaydi."""
-    global JOBS, DB_MESSAGE_ID
+    global CHANNELS, JOBS, DB_MESSAGE_ID
     try:
         chat = await bot.get_chat(DB_GROUP_ID)
         pinned = chat.pinned_message
         if pinned and pinned.text and pinned.text.startswith(DB_MARKER):
-            JOBS = _deserialize_jobs(pinned.text)
+            CHANNELS, JOBS = _deserialize_state(pinned.text)
             DB_MESSAGE_ID = pinned.message_id
-            log.info("DB tiklandi: %d ta job topildi", len(JOBS))
+            log.info("DB tiklandi: %d kanal, %d job", len(CHANNELS), len(JOBS))
             return
     except Exception:
         log.exception("DB o'qishda xato, yangi DB xabari yaratiladi")
 
-    # pinned xabar topilmadi -> yangisini yaratamiz
-    msg = await bot.send_message(DB_GROUP_ID, _serialize_jobs())
+    msg = await bot.send_message(DB_GROUP_ID, _serialize_state())
     try:
         await bot.pin_chat_message(DB_GROUP_ID, msg.message_id, disable_notification=True)
     except Exception:
@@ -131,9 +133,8 @@ async def db_load_on_startup() -> None:
 
 
 async def db_save() -> None:
-    """JOBS o'zgarganda DB_GROUP dagi pinned xabarni yangilaydi."""
     global DB_MESSAGE_ID
-    text = _serialize_jobs()
+    text = _serialize_state()
     if DB_MESSAGE_ID is None:
         msg = await bot.send_message(DB_GROUP_ID, text)
         DB_MESSAGE_ID = msg.message_id
@@ -152,6 +153,28 @@ async def db_save() -> None:
             await bot.pin_chat_message(DB_GROUP_ID, msg.message_id, disable_notification=True)
         except Exception:
             pass
+
+# ---------------------------------------------------------------------------
+# Kanallarni dinamik aniqlash: bot biror kanalga admin qilib qo'shilganda
+# ---------------------------------------------------------------------------
+
+@router.my_chat_member()
+async def on_bot_membership_changed(event: ChatMemberUpdated) -> None:
+    if event.chat.type not in ("channel",):
+        return
+    chat_id = str(event.chat.id)
+    new_status = event.new_chat_member.status
+
+    if new_status in ADMIN_STATUSES:
+        if chat_id not in CHANNELS:
+            CHANNELS[chat_id] = {"title": event.chat.title or chat_id}
+            await db_save()
+            log.info("Yangi kanal ro'yxatga qo'shildi: %s (%s)", event.chat.title, chat_id)
+    else:
+        if chat_id in CHANNELS:
+            CHANNELS.pop(chat_id, None)
+            await db_save()
+            log.info("Kanal ro'yxatdan olib tashlandi (bot admin emas): %s", chat_id)
 
 # ---------------------------------------------------------------------------
 # Xabarni yuborish (scheduled ish)
@@ -198,6 +221,22 @@ def restore_scheduler_jobs() -> None:
         JOBS.pop(job_id, None)
 
 # ---------------------------------------------------------------------------
+# Ruxsat tekshirish: foydalanuvchi shu kanalda ADMIN bo'lishi shart
+# ---------------------------------------------------------------------------
+
+async def user_admin_channels(user_id: int) -> dict:
+    """Foydalanuvchi ADMIN bo'lgan (va bot ham admin bo'lgan) kanallar."""
+    result = {}
+    for chat_id_str, info in CHANNELS.items():
+        try:
+            member = await bot.get_chat_member(int(chat_id_str), user_id)
+            if member.status in ADMIN_STATUSES:
+                result[chat_id_str] = info
+        except Exception:
+            continue
+    return result
+
+# ---------------------------------------------------------------------------
 # FSM: /schedule oqimi
 # ---------------------------------------------------------------------------
 
@@ -215,8 +254,11 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def channels_kb() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text=str(ch), callback_data=f"ch:{ch}")] for ch in CHANNELS]
+def channels_kb(channels: dict) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=info["title"], callback_data=f"ch:{chat_id}")]
+        for chat_id, info in channels.items()
+    ]
     rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="menu:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -230,10 +272,13 @@ def confirm_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def job_list_kb() -> InlineKeyboardMarkup:
+def job_list_kb(user_id: int) -> InlineKeyboardMarkup:
     rows = []
     for job_id, job in JOBS.items():
-        label = f"{job['run_time'][:16].replace('T', ' ')} -> {job['target_chat_id']}"
+        if job.get("created_by") != user_id:
+            continue
+        title = CHANNELS.get(str(job["target_chat_id"]), {}).get("title", str(job["target_chat_id"]))
+        label = f"{job['run_time'][:16].replace('T', ' ')} -> {title}"
         rows.append([
             InlineKeyboardButton(text=label, callback_data="noop"),
             InlineKeyboardButton(text="❌", callback_data=f"del:{job_id}"),
@@ -242,15 +287,15 @@ def job_list_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def is_superadmin(user_id: int | None) -> bool:
-    return user_id == SUPERADMIN_ID
-
-
 @router.message(CommandStart())
 async def cmd_start(message: Message):
-    if message.chat.type != "private" or not is_superadmin(message.from_user.id):
+    if message.chat.type != "private":
         return
-    await message.answer("Salom! Nima qilamiz?", reply_markup=main_menu_kb())
+    await message.answer(
+        "Salom! Meni istalgan kanalingizga ADMIN qilib qo'shing, "
+        "shundan so'ng o'sha kanalga post rejalashtira olasiz.\n\nNima qilamiz?",
+        reply_markup=main_menu_kb(),
+    )
 
 
 @router.callback_query(F.data == "menu:back")
@@ -262,48 +307,51 @@ async def menu_back(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "menu:schedule")
 async def menu_schedule(callback: CallbackQuery, state: FSMContext):
-    if not is_superadmin(callback.from_user.id):
-        return await callback.answer()
-    if not CHANNELS:
-        return await callback.answer("CHANNELS sozlanmagan.", show_alert=True)
+    my_channels = await user_admin_channels(callback.from_user.id)
+    if not my_channels:
+        return await callback.answer(
+            "Siz admin bo'lgan va bot ham admin bo'lgan kanal topilmadi. "
+            "Avval botni kanalingizga admin qilib qo'shing.",
+            show_alert=True,
+        )
     await state.set_state(ScheduleStates.choosing_channel)
-    await callback.message.edit_text("Qaysi kanalga yuborilsin?", reply_markup=channels_kb())
+    await callback.message.edit_text("Qaysi kanalga yuborilsin?", reply_markup=channels_kb(my_channels))
     await callback.answer()
 
 
 @router.callback_query(F.data == "menu:list")
 async def menu_list(callback: CallbackQuery):
-    if not is_superadmin(callback.from_user.id):
-        return await callback.answer()
-    if not JOBS:
+    my_jobs = {jid: j for jid, j in JOBS.items() if j.get("created_by") == callback.from_user.id}
+    if not my_jobs:
         await callback.message.edit_text(
-            "Rejalashtirilgan post yo'q.",
+            "Sizda rejalashtirilgan post yo'q.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="menu:back")]
             ]),
         )
     else:
-        await callback.message.edit_text("Rejalashtirilgan postlar:", reply_markup=job_list_kb())
+        await callback.message.edit_text("Rejalashtirilgan postlaringiz:", reply_markup=job_list_kb(callback.from_user.id))
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("del:"))
 async def delete_job(callback: CallbackQuery):
-    if not is_superadmin(callback.from_user.id):
-        return await callback.answer()
     job_id = callback.data.split(":", 1)[1]
-    if job_id in JOBS:
-        JOBS.pop(job_id)
+    job = JOBS.get(job_id)
+    if job and job.get("created_by") == callback.from_user.id:
+        JOBS.pop(job_id, None)
         await db_save()
         try:
             scheduler.remove_job(job_id)
         except Exception:
             pass
-    if JOBS:
-        await callback.message.edit_text("Rejalashtirilgan postlar:", reply_markup=job_list_kb())
+
+    my_jobs = {jid: j for jid, j in JOBS.items() if j.get("created_by") == callback.from_user.id}
+    if my_jobs:
+        await callback.message.edit_text("Rejalashtirilgan postlaringiz:", reply_markup=job_list_kb(callback.from_user.id))
     else:
         await callback.message.edit_text(
-            "Rejalashtirilgan post yo'q.",
+            "Sizda rejalashtirilgan post yo'q.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="menu:back")]
             ]),
@@ -319,6 +367,14 @@ async def noop(callback: CallbackQuery):
 @router.callback_query(ScheduleStates.choosing_channel, F.data.startswith("ch:"))
 async def choose_channel(callback: CallbackQuery, state: FSMContext):
     channel_id = int(callback.data.split(":", 1)[1])
+    # xavfsizlik: foydalanuvchi haqiqatan ham shu kanalda admin ekanini qayta tekshiramiz
+    try:
+        member = await bot.get_chat_member(channel_id, callback.from_user.id)
+        if member.status not in ADMIN_STATUSES:
+            return await callback.answer("Siz bu kanalda admin emassiz.", show_alert=True)
+    except Exception:
+        return await callback.answer("Kanalni tekshirib bo'lmadi.", show_alert=True)
+
     await state.update_data(target_chat_id=channel_id)
     await state.set_state(ScheduleStates.waiting_content)
     await callback.message.edit_text(
@@ -353,10 +409,11 @@ async def receive_datetime(message: Message, state: FSMContext):
 
     await state.update_data(run_time=run_time.isoformat())
     data = await state.get_data()
+    title = CHANNELS.get(str(data["target_chat_id"]), {}).get("title", str(data["target_chat_id"]))
     await state.set_state(ScheduleStates.confirming)
     await message.answer(
         "Tasdiqlaysizmi?\n"
-        f"Kanal: <code>{data['target_chat_id']}</code>\n"
+        f"Kanal: <b>{title}</b>\n"
         f"Vaqt: <code>{run_time.strftime('%Y-%m-%d %H:%M')}</code>",
         reply_markup=confirm_kb(),
     )
@@ -379,6 +436,7 @@ async def confirm_schedule(callback: CallbackQuery, state: FSMContext):
         "from_chat_id": data["from_chat_id"],
         "message_id": data["message_id"],
         "run_time": data["run_time"],
+        "created_by": callback.from_user.id,
     }
     await db_save()
     schedule_job(job_id, run_time)
@@ -390,12 +448,12 @@ async def confirm_schedule(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 # ---------------------------------------------------------------------------
-# Avtomatik reaksiya: har bir kanaldagi HAR QANDAY postga ⚡
+# Avtomatik reaksiya: har bir (dinamik) kanaldagi HAR QANDAY postga ⚡
 # ---------------------------------------------------------------------------
 
 @router.channel_post()
 async def auto_react(message: Message):
-    if message.chat.id not in CHANNELS:
+    if str(message.chat.id) not in CHANNELS:
         return
     try:
         await bot.set_message_reaction(
